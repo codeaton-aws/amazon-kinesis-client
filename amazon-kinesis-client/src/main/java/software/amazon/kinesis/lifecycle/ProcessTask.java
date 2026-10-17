@@ -93,7 +93,10 @@ public class ProcessTask implements ConsumerTask {
         this.schemaRegistryDecoder = schemaRegistryDecoder;
 
         if (!skipShardSyncAtWorkerInitializationIfLeasesExist) {
-            this.shard = shardDetector.shard(shardInfo.shardId());
+            // KCLTT-850: retry a failed shard lookup (e.g. ListShards TimeoutException) instead of letting it throw
+            // out of the constructor. The batch was already acked to the publisher, so a throw here drops it.
+            this.shard = ShardLookupRetrier.lookup(shardDetector, shardInfo.shardId(), shardInfoId,
+                    ShardLookupRetrier.DEFAULT_MAX_ATTEMPTS, backoffTimeMillis);
         } else {
             this.shard = null;
         }
