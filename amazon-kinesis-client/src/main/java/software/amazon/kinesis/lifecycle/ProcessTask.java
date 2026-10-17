@@ -92,11 +92,18 @@ public class ProcessTask implements ConsumerTask {
         this.metricsFactory = metricsFactory;
         this.schemaRegistryDecoder = schemaRegistryDecoder;
 
+        Shard detectedShard = null;
         if (!skipShardSyncAtWorkerInitializationIfLeasesExist) {
-            this.shard = shardDetector.shard(shardInfo.shardId());
-        } else {
-            this.shard = null;
+            try {
+                detectedShard = shardDetector.shard(shardInfo.shardId());
+            } catch (RuntimeException e) {
+                // KCLTT-850: a failed shard lookup (ListShards timeout/5xx) must not abort the task. The batch was
+                // already acknowledged to the publisher, so throwing here drops it for good. Process it without the
+                // KPL hash-range de-duplication filter instead (same as skipShardSync...=true).
+                log.warn("{}: shard lookup failed, processing batch without KPL de-duplication", shardInfoId, e);
+            }
         }
+        this.shard = detectedShard;
 
         if (this.shard == null && !skipShardSyncAtWorkerInitializationIfLeasesExist) {
             log.warn("Cannot get the shard for this ProcessTask, so duplicate KPL user records "
