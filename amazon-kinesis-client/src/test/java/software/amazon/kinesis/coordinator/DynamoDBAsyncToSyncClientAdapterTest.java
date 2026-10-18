@@ -1,13 +1,16 @@
 package software.amazon.kinesis.coordinator;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeoutException;
 
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeAction;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
@@ -30,6 +33,7 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.UpdateItemResponse;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -65,6 +69,24 @@ public class DynamoDBAsyncToSyncClientAdapterTest {
 
         assertEquals(expectedResponse, actualResponse);
         verify(mockAsyncClient).getItem(request);
+    }
+
+    @Test
+    public void testHungCallTimesOutAndIsCancelled() {
+        final DynamoDbAsyncToSyncClientAdapter timedAdapter =
+                new DynamoDbAsyncToSyncClientAdapter(mockAsyncClient, Duration.ofMillis(100));
+        final GetItemRequest request =
+                GetItemRequest.builder().tableName(TEST_TABLE_NAME).build();
+        final CompletableFuture<GetItemResponse> neverCompletes = new CompletableFuture<>();
+        when(mockAsyncClient.getItem(request)).thenReturn(neverCompletes);
+
+        try {
+            timedAdapter.getItem(request);
+            fail("Expected SdkClientException");
+        } catch (final SdkClientException e) {
+            assertTrue(e.getCause() instanceof TimeoutException);
+        }
+        assertTrue(neverCompletes.isCancelled());
     }
 
     @Test

@@ -15,10 +15,14 @@
 
 package software.amazon.kinesis.coordinator;
 
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.BatchGetItemRequest;
@@ -47,18 +51,29 @@ import software.amazon.awssdk.services.dynamodb.paginators.BatchGetItemIterable;
 import software.amazon.awssdk.services.dynamodb.paginators.QueryIterable;
 import software.amazon.awssdk.services.dynamodb.paginators.ScanIterable;
 import software.amazon.kinesis.annotations.KinesisClientInternalApi;
+import software.amazon.kinesis.leases.LeaseManagementConfig;
 
 /**
  * DDB Lock client depends on DynamoDbClient and KCL only has DynamoDbAsyncClient configured.
  * This wrapper delegates APIs from sync client to async client internally so that it can
  * be used with the DDB Lock client.
+ * <p>
+ * Every call waits at most {@code timeout} for the async client. A call that does not complete in time is
+ * cancelled and fails with an {@link SdkClientException}, so a hung request cannot block a caller (for example
+ * the synchronized leader decider shared by the Scheduler and lease assignment threads) indefinitely.
  */
 @KinesisClientInternalApi
 public class DynamoDbAsyncToSyncClientAdapter implements DynamoDbClient {
     private final DynamoDbAsyncClient asyncClient;
+    private final Duration timeout;
 
     public DynamoDbAsyncToSyncClientAdapter(final DynamoDbAsyncClient asyncClient) {
+        this(asyncClient, LeaseManagementConfig.DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    public DynamoDbAsyncToSyncClientAdapter(final DynamoDbAsyncClient asyncClient, final Duration timeout) {
         this.asyncClient = asyncClient;
+        this.timeout = timeout;
     }
 
     @Override
@@ -72,11 +87,25 @@ public class DynamoDbAsyncToSyncClientAdapter implements DynamoDbClient {
     }
 
     private <T> T handleException(final Supplier<CompletableFuture<T>> task) {
+        final CompletableFuture<T> future = task.get();
         try {
-            return task.get().join();
-        } catch (final CompletionException e) {
+            return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (final ExecutionException e) {
             rethrow(e.getCause());
             return null;
+        } catch (final TimeoutException e) {
+            future.cancel(true);
+            throw SdkClientException.builder()
+                    .message("DynamoDB call did not complete within " + timeout)
+                    .cause(e)
+                    .build();
+        } catch (final InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw SdkClientException.builder()
+                    .message("Interrupted while waiting for DynamoDB call")
+                    .cause(e)
+                    .build();
         }
     }
 
