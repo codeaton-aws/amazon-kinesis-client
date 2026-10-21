@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import software.amazon.kinesis.leases.Lease;
+import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -391,6 +392,145 @@ class LeaseCountBasedLeaseAssignmentDeciderTest {
         verify(inMemoryStorageView, never()).performLeaseAssignment(any(), eq("deadWorker"));
         verify(inMemoryStorageView, times(3)).performLeaseAssignment(any(), any());
         assertTrue(expiredLeases.isEmpty());
+    }
+
+    @Test
+    void assignExpiredOrUnassignedLeases_shardEndLeasesDoNotTakeASlot() {
+        // worker1 holds 9 SHARD_END leases (waiting for cleanup) and 1 active lease: only 1 of 10 slots is used
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        Set<Lease> held = new HashSet<>();
+        for (int i = 0; i < 9; i++) {
+            Lease ended = createLease("ended" + i, "worker1", 10L + i);
+            when(ended.checkpoint()).thenReturn(ExtendedSequenceNumber.SHARD_END);
+            held.add(ended);
+        }
+        held.add(createLease("active", "worker1", 50L));
+        workerToLeasesMap.put("worker1", held);
+        List<Lease> unassigned = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            unassigned.add(createLease("new" + i, null, i * 100L));
+        }
+        List<Lease> all = new ArrayList<>(held);
+        all.addAll(unassigned);
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(Collections.singleton("worker1"));
+        when(inMemoryStorageView.getLeaseList()).thenReturn(all);
+
+        decider.assignExpiredOrUnassignedLeases(unassigned);
+
+        verify(inMemoryStorageView, times(5)).performLeaseAssignment(any(), eq("worker1"));
+        assertTrue(unassigned.isEmpty());
+    }
+
+    @Test
+    void assignExpiredOrUnassignedLeases_neverExceedsMaxLeasesCountingActiveLeases() {
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        Set<Lease> held = new HashSet<>();
+        for (int i = 0; i < MAX_LEASES_FOR_WORKER; i++) {
+            held.add(createLease("held" + i, "worker1", 10L + i));
+        }
+        workerToLeasesMap.put("worker1", held);
+        List<Lease> unassigned = new ArrayList<>(Arrays.asList(createLease("new1", null, 100L)));
+        List<Lease> all = new ArrayList<>(held);
+        all.addAll(unassigned);
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(Collections.singleton("worker1"));
+        when(inMemoryStorageView.getLeaseList()).thenReturn(all);
+
+        decider.assignExpiredOrUnassignedLeases(unassigned);
+
+        verify(inMemoryStorageView, never()).performLeaseAssignment(any(), any());
+        assertEquals(1, unassigned.size());
+    }
+
+    @Test
+    void assignExpiredOrUnassignedLeases_parentLeasesAssignedBeforeLeafLeases() {
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        Set<Lease> held = new HashSet<>();
+        for (int i = 0; i < MAX_LEASES_FOR_WORKER - 1; i++) {
+            held.add(createLease("held" + i, "worker1", 10L + i));
+        }
+        workerToLeasesMap.put("worker1", held);
+        Lease leaf = createLease("leaf", null, 100L);
+        Lease parent = createLease("parent", null, 200L);
+        when(inMemoryStorageView.isParentOfAnotherLease(parent)).thenReturn(true);
+        List<Lease> unassigned = new ArrayList<>(Arrays.asList(leaf, parent));
+        List<Lease> all = new ArrayList<>(held);
+        all.addAll(unassigned);
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(Collections.singleton("worker1"));
+        when(inMemoryStorageView.getLeaseList()).thenReturn(all);
+
+        decider.assignExpiredOrUnassignedLeases(unassigned);
+
+        verify(inMemoryStorageView).performLeaseAssignment(parent, "worker1");
+        verify(inMemoryStorageView, never()).performLeaseAssignment(leaf, "worker1");
+    }
+
+    @Test
+    void balanceWorkerVariance_doesNotMoveBlockedLeases() {
+        Lease blocked = createLease("blocked", "worker1", 100L);
+        when(inMemoryStorageView.isLeaseBlocked(blocked)).thenReturn(true);
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        workerToLeasesMap.put(
+                "worker1",
+                new HashSet<>(
+                        Arrays.asList(blocked, createLease("a1", "worker1", 10L) /* keeps worker1 above target */)));
+        workerToLeasesMap.get("worker1").add(createLease("a2", "worker1", 11L));
+        workerToLeasesMap.put("worker2", new HashSet<>());
+        Set<String> workers = new HashSet<>(Arrays.asList("worker1", "worker2"));
+        List<Lease> all = new ArrayList<>(workerToLeasesMap.get("worker1"));
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(workers);
+        when(inMemoryStorageView.getLeaseList()).thenReturn(all);
+
+        decider.balanceWorkerVariance();
+
+        verify(inMemoryStorageView, never()).performLeaseAssignment(eq(blocked), any());
+    }
+
+    @Test
+    void assignExpiredOrUnassignedLeases_expiredLeaseOfFullWorkerIsReassigned() {
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        Set<Lease> held = new HashSet<>();
+        for (int i = 0; i < MAX_LEASES_FOR_WORKER - 1; i++) {
+            held.add(createLease("held" + i, "worker1", 10L + i));
+        }
+        Lease expired = createLease("expired", "worker1", 5L);
+        held.add(expired);
+        workerToLeasesMap.put("worker1", held);
+        workerToLeasesMap.put("worker2", new HashSet<>());
+        List<Lease> expiredLeases = new ArrayList<>(Arrays.asList(expired));
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(new HashSet<>(Arrays.asList("worker1", "worker2")));
+        when(inMemoryStorageView.getLeaseList()).thenReturn(new ArrayList<>(held));
+
+        decider.assignExpiredOrUnassignedLeases(expiredLeases);
+
+        verify(inMemoryStorageView).performLeaseAssignment(expired, "worker2");
+        assertTrue(expiredLeases.isEmpty());
+    }
+
+    @Test
+    void assignExpiredOrUnassignedLeases_pendingHandoffCountsForIncomingOwner() {
+        Map<String, Set<Lease>> workerToLeasesMap = new HashMap<>();
+        Set<Lease> held = new HashSet<>();
+        for (int i = 0; i < MAX_LEASES_FOR_WORKER - 1; i++) {
+            held.add(createLease("held" + i, "worker1", 10L + i));
+        }
+        workerToLeasesMap.put("worker1", held);
+        when(inMemoryStorageView.getPendingHandoffInCount("worker1")).thenReturn(1);
+        List<Lease> unassigned = new ArrayList<>(Arrays.asList(createLease("new", null, 100L)));
+        List<Lease> all = new ArrayList<>(held);
+        all.addAll(unassigned);
+        when(inMemoryStorageView.getWorkerToLeasesMap()).thenReturn(workerToLeasesMap);
+        when(inMemoryStorageView.getActiveWorkerIdSet()).thenReturn(Collections.singleton("worker1"));
+        when(inMemoryStorageView.getLeaseList()).thenReturn(all);
+
+        decider.assignExpiredOrUnassignedLeases(unassigned);
+
+        // 9 held + 1 being handed off to worker1 = 10 = max: nothing more
+        verify(inMemoryStorageView, never()).performLeaseAssignment(any(), any());
     }
 
     private Lease createLease(String leaseKey, String owner, long lastCounterIncrement) {

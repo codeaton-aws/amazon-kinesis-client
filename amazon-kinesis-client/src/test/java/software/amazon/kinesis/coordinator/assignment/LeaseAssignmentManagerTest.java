@@ -3,6 +3,7 @@ package software.amazon.kinesis.coordinator.assignment;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +57,7 @@ import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
 import software.amazon.kinesis.metrics.NullMetricsFactory;
+import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 import software.amazon.kinesis.worker.metricstats.WorkerMetricStats;
 import software.amazon.kinesis.worker.metricstats.WorkerMetricStats.LeaseTableWorkerMetricStats;
 import software.amazon.kinesis.worker.metricstats.WorkerMetricStatsDAO;
@@ -708,6 +710,64 @@ class LeaseAssignmentManagerTest {
         leaseAssignmentManagerRunnable.run();
         // After 3 failures, leadership is expected to be released.
         verify(mockLeaderDecider, times(1)).releaseLeadershipIfHeld();
+    }
+
+    @Test
+    void performAssignment_maxLeasesSet_blockedChildAndShardEndLeaseDoNotTakeASlot() throws Exception {
+        createLeaseAssignmentManager(
+                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20), 100_000L, System::nanoTime, 2);
+        workerMetricsDAO.updateMetrics(createDummyTakeWorkerMetrics(TEST_TAKE_WORKER_ID));
+        populateBlockedLineage();
+
+        leaseAssignmentManagerRunnable.run();
+
+        // the blocked child is assigned but does not take a slot; the SHARD_END parent does not take a slot either
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.getLease("child").leaseOwner());
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.getLease("free").leaseOwner());
+    }
+
+    @Test
+    void performAssignment_maxLeasesSet_childAssignedAfterParentsReachShardEnd() throws Exception {
+        createLeaseAssignmentManager(
+                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20), 100_000L, System::nanoTime, 3);
+        workerMetricsDAO.updateMetrics(createDummyTakeWorkerMetrics(TEST_TAKE_WORKER_ID));
+        populateBlockedLineage();
+        leaseAssignmentManagerRunnable.run();
+
+        final Lease parent = leaseRefresher.getLease("parentActive");
+        parent.checkpoint(ExtendedSequenceNumber.SHARD_END);
+        leaseRefresher.updateLease(parent);
+        leaseAssignmentManagerRunnable.run();
+
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.getLease("child").leaseOwner());
+    }
+
+    @Test
+    void performAssignment_maxLeasesNotSet_blockedChildIsAssignedAsBefore() throws Exception {
+        createLeaseAssignmentManager(
+                getWorkerUtilizationAwareAssignmentConfig(Double.MAX_VALUE, 20),
+                100_000L,
+                System::nanoTime,
+                Integer.MAX_VALUE);
+        workerMetricsDAO.updateMetrics(createDummyTakeWorkerMetrics(TEST_TAKE_WORKER_ID));
+        populateBlockedLineage();
+
+        leaseAssignmentManagerRunnable.run();
+
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.getLease("child").leaseOwner());
+        assertEquals(TEST_TAKE_WORKER_ID, leaseRefresher.getLease("free").leaseOwner());
+    }
+
+    /** parentActive (owned, processing), parentEnded (owned, SHARD_END), child of parentActive and free (unassigned). */
+    private void populateBlockedLineage() throws Exception {
+        leaseRefresher.createLeaseIfNotExists(createDummyLease("parentActive", TEST_TAKE_WORKER_ID));
+        final Lease parentEnded = createDummyLease("parentEnded", TEST_TAKE_WORKER_ID);
+        parentEnded.checkpoint(ExtendedSequenceNumber.SHARD_END);
+        leaseRefresher.createLeaseIfNotExists(parentEnded);
+        final Lease child = createDummyUnAssignedLease("child");
+        child.parentShardIds(Collections.singleton("parentActive"));
+        leaseRefresher.createLeaseIfNotExists(child);
+        leaseRefresher.createLeaseIfNotExists(createDummyUnAssignedLease("free"));
     }
 
     private void populateLeasesInLeaseTable(Lease... leases) throws Exception {

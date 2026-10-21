@@ -112,7 +112,12 @@ public final class VarianceBasedLeaseAssignmentDecider implements LeaseAssignmen
         // Sort the expiredOrUnAssignedLeases using lastCounterIncrementNanos such that leases expired first are
         // picked first.
         // Unassigned leases have lastCounterIncrementNanos as zero and thus assigned first.
-        Collections.sort(expiredOrUnAssignedLeases, Comparator.comparing(Lease::lastCounterIncrementNanos));
+        // Leases that are a parent of another lease first (finishing them unblocks children), then oldest first.
+        Collections.sort(
+                expiredOrUnAssignedLeases,
+                Comparator.comparingInt((Lease lease) -> inMemoryStorageView.isParentOfAnotherLease(lease) ? 0 : 1)
+                        .thenComparing(
+                                Lease::lastCounterIncrementNanos, Comparator.nullsFirst(Comparator.naturalOrder())));
         final Set<Lease> assignedLeases = new HashSet<>();
         for (final Lease lease : expiredOrUnAssignedLeases) {
             final WorkerMetricStats workerToAssignLease = assignableWorkerSortedByAvailableCapacity.poll();
