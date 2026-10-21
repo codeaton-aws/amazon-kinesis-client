@@ -67,6 +67,7 @@ import software.amazon.kinesis.leases.LeaseManagementConfig;
 import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.LeaseSerializer;
 import software.amazon.kinesis.leases.MultiStreamLease;
+import software.amazon.kinesis.leases.ReadyFirstShardPrioritization;
 import software.amazon.kinesis.leases.ShardDetector;
 import software.amazon.kinesis.leases.ShardInfo;
 import software.amazon.kinesis.leases.ShardPrioritization;
@@ -148,6 +149,9 @@ public class Scheduler implements Runnable {
     private final Map<StreamConfig, ShardSyncTaskManager> streamToShardSyncTaskManagerMap = new ConcurrentHashMap<>();
     private final PeriodicShardSyncManager leaderElectedPeriodicShardSyncManager;
     private final ShardPrioritization shardPrioritization;
+    /** Set when maxLeasesForWorker is set; see {@link #createShardPrioritization()}. */
+    private final ReadyFirstShardPrioritization readyFirstShardPrioritization;
+
     private final boolean cleanupLeasesUponShardCompletion;
     private final boolean skipShardSyncAtWorkerInitializationIfLeasesExist;
     private final GracefulShutdownCoordinator gracefulShutdownCoordinator;
@@ -283,7 +287,10 @@ public class Scheduler implements Runnable {
         this.shardSyncTaskManagerProvider = streamConfig -> this.leaseManagementConfig
                 .leaseManagementFactory(leaseSerializer, isMultiStreamMode)
                 .createShardSyncTaskManager(this.metricsFactory, streamConfig, this.deletedStreamListProvider);
-        this.shardPrioritization = this.coordinatorConfig.shardPrioritization();
+        this.shardPrioritization = createShardPrioritization();
+        this.readyFirstShardPrioritization = this.shardPrioritization instanceof ReadyFirstShardPrioritization
+                ? (ReadyFirstShardPrioritization) this.shardPrioritization
+                : null;
         this.cleanupLeasesUponShardCompletion = this.leaseManagementConfig.cleanupLeasesUponShardCompletion();
         this.skipShardSyncAtWorkerInitializationIfLeasesExist =
                 this.coordinatorConfig.skipShardSyncAtWorkerInitializationIfLeasesExist();
@@ -447,6 +454,7 @@ public class Scheduler implements Runnable {
                 shardConsumer.executeLifecycle();
                 assignedShards.add(shardInfo);
             }
+            releaseLeasesWaitingForASlot();
 
             // clean up shard consumers for unassigned shards
             cleanupShardConsumers(assignedShards);
@@ -941,6 +949,53 @@ public class Scheduler implements Runnable {
         }
         shutdownComplete = true;
         finalShutdownLatch.countDown();
+    }
+
+    /**
+     * With maxLeasesForWorker set, a worker can hold more leases than the limit: blocked child leases and leases at
+     * SHARD_END do not take a slot when leases are assigned. The configured prioritization is then wrapped so that the
+     * worker processes at most maxLeasesForWorker leases at a time, ready leases first. Without maxLeasesForWorker the
+     * configured prioritization is used as is.
+     */
+    private ShardPrioritization createShardPrioritization() {
+        final ShardPrioritization configured = this.coordinatorConfig.shardPrioritization();
+        final int maxLeasesForWorker = this.leaseManagementConfig.maxLeasesForWorker();
+        if (maxLeasesForWorker == Integer.MAX_VALUE || configured instanceof ReadyFirstShardPrioritization) {
+            return configured;
+        }
+        return new ReadyFirstShardPrioritization(
+                configured,
+                maxLeasesForWorker,
+                this.leaseRefresher,
+                this.parentShardPollIntervalMillis,
+                6 * this.leaseManagementConfig.failoverTimeMillis());
+    }
+
+    /**
+     * Releases ready leases that have waited too long for a slot on this worker (see
+     * {@link ReadyFirstShardPrioritization#leasesToRelease()}): the lease is evicted in the lease table so that a
+     * worker with a free slot can take it, and this worker stops renewing it. No shard consumer was started for it.
+     */
+    private void releaseLeasesWaitingForASlot() {
+        if (readyFirstShardPrioritization == null) {
+            return;
+        }
+        for (final String leaseKey : readyFirstShardPrioritization.leasesToRelease()) {
+            final Lease lease = leaseCoordinator.getCurrentlyHeldLease(leaseKey);
+            if (lease == null) {
+                continue;
+            }
+            try {
+                if (leaseRefresher.evictLease(lease)) {
+                    leaseCoordinator.dropLease(lease);
+                    log.info(
+                            "Released lease {}: it is ready but this worker is processing maxLeasesForWorker leases",
+                            leaseKey);
+                }
+            } catch (DependencyException | InvalidStateException | ProvisionedThroughputException e) {
+                log.warn("Failed to release lease {}; it is retried after the release delay", leaseKey, e);
+            }
+        }
     }
 
     private List<ShardInfo> getShardInfoForAssignments() {

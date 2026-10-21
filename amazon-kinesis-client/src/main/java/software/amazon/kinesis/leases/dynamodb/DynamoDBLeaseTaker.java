@@ -17,6 +17,7 @@ package software.amazon.kinesis.leases.dynamodb;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -34,6 +35,7 @@ import software.amazon.kinesis.annotations.KinesisClientInternalApi;
 import software.amazon.kinesis.leases.Lease;
 import software.amazon.kinesis.leases.LeaseRefresher;
 import software.amazon.kinesis.leases.LeaseTaker;
+import software.amazon.kinesis.leases.MultiStreamLease;
 import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
@@ -41,6 +43,7 @@ import software.amazon.kinesis.metrics.MetricsFactory;
 import software.amazon.kinesis.metrics.MetricsLevel;
 import software.amazon.kinesis.metrics.MetricsScope;
 import software.amazon.kinesis.metrics.MetricsUtil;
+import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 
 import static software.amazon.kinesis.common.CommonCalculations.getRenewerTakerIntervalMillis;
 
@@ -404,6 +407,68 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
                 .collect(Collectors.toList());
     }
 
+    private static boolean isShardEnd(final Lease lease) {
+        return ExtendedSequenceNumber.SHARD_END.equals(lease.checkpoint());
+    }
+
+    /**
+     * A lease takes a maxLeasesForWorker slot unless it is at SHARD_END or a child that is still blocked on a parent.
+     * A worker processes at most maxLeasesForWorker leases at a time, ready leases first (see
+     * ReadyFirstShardPrioritization).
+     */
+    private boolean isCounted(final Lease lease) {
+        return !isShardEnd(lease) && !isBlocked(lease);
+    }
+
+    /**
+     * A child lease is blocked while any immediate parent lease is still in the lease table and not at SHARD_END.
+     * Blocked leases are taken within the balance target but do not take a slot. Only used when maxLeasesForWorker is
+     * set.
+     */
+    private boolean isBlocked(final Lease lease) {
+        if (!isMaxLeasesForWorkerSet()) {
+            return false;
+        }
+        if (isShardEnd(lease) || lease.parentShardIds() == null) {
+            return false;
+        }
+        for (final String parentShardId : lease.parentShardIds()) {
+            final Lease parent = allLeases.get(parentLeaseKey(lease, parentShardId));
+            if (parent != null && !isShardEnd(parent)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Takes up to {@code room} of the available blocked leases; they do not take a maxLeasesForWorker slot. */
+    private static void takeBlockedLeases(final List<Lease> blockedAvailable, final int room, final Set<Lease> out) {
+        for (int i = 0; i < room && i < blockedAvailable.size(); i++) {
+            out.add(blockedAvailable.get(i));
+        }
+    }
+
+    private boolean isMaxLeasesForWorkerSet() {
+        return maxLeasesForWorker != Integer.MAX_VALUE;
+    }
+
+    private static String parentLeaseKey(final Lease lease, final String parentShardId) {
+        return lease instanceof MultiStreamLease
+                ? MultiStreamLease.getLeaseKey(((MultiStreamLease) lease).streamIdentifier(), parentShardId)
+                : parentShardId;
+    }
+
+    /** Leases that some other lease names as a parent; taking these first lets a lineage progress. */
+    private Set<String> parentLeaseKeys() {
+        final Set<String> keys = new HashSet<>();
+        for (final Lease lease : allLeases.values()) {
+            if (lease.parentShardIds() != null) {
+                lease.parentShardIds().forEach(p -> keys.add(parentLeaseKey(lease, p)));
+            }
+        }
+        return keys;
+    }
+
     /**
      * Compute the number of leases I should try to take based on the state of the system.
      *
@@ -416,6 +481,28 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
             throws DependencyException {
         Map<String, Integer> leaseCounts = computeLeaseCounts(availableLeases);
         Set<Lease> leasesToTake = new HashSet<>();
+        final Set<Lease> availableLeaseSet = new HashSet<>(availableLeases);
+        // Includes this worker's own expired leases (e.g. dropped by a shutdown task): the lease table still shows
+        // this worker as their owner, and retaking one of them does not use a new slot (see below).
+        final int myCountedLeases = (int) allLeases.values().stream()
+                .filter(lease -> workerIdentifier.equals(lease.leaseOwner()))
+                .filter(this::isCounted)
+                .count();
+        // With maxLeasesForWorker set, leases at SHARD_END take no slot and are left out of this worker's balance
+        // count.
+        final int myHeldNotCounted = (int) allLeases.values().stream()
+                .filter(lease -> workerIdentifier.equals(lease.leaseOwner()))
+                .filter(lease -> !availableLeaseSet.contains(lease))
+                .filter(lease -> isMaxLeasesForWorkerSet() && isShardEnd(lease))
+                .count();
+        final List<Lease> blockedAvailable = availableLeases.stream()
+                .filter(this::isBlocked)
+                .filter(lease -> !workerIdentifier.equals(lease.leaseOwner()))
+                .collect(Collectors.toList());
+        Collections.shuffle(blockedAvailable);
+        final int numBlockedAvailable = blockedAvailable.size();
+        availableLeases = new ArrayList<>(availableLeases);
+        availableLeases.removeAll(blockedAvailable);
         final MetricsScope scope = MetricsUtil.createMetricsWithOperation(metricsFactory, TAKE_LEASES_DIMENSION);
         MetricsUtil.addWorkerIdentifier(scope, workerIdentifier);
 
@@ -444,30 +531,52 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
                  */
                 target = numLeases / numWorkers + (numLeases % numWorkers == 0 ? 0 : 1);
 
-                // Spill over is the number of leases this worker should have claimed, but did not because it would
-                // exceed the max allowed for this worker.
-                leaseSpillover = Math.max(0, target - maxLeasesForWorker);
-                if (target > maxLeasesForWorker) {
-                    log.warn(
-                            "Worker {} target is {} leases and maxLeasesForWorker is {}. Resetting target to {},"
-                                    + " lease spillover is {}. Note that some shards may not be processed if no other "
-                                    + "workers are able to pick them up.",
-                            workerIdentifier,
-                            target,
-                            maxLeasesForWorker,
-                            maxLeasesForWorker,
-                            leaseSpillover);
-                    target = maxLeasesForWorker;
-                }
+                // maxLeasesForWorker is a hard cap on counted (non-SHARD_END) leases, applied below; not on target.
             }
 
-            int myCount = leaseCounts.get(workerIdentifier);
-            numLeasesToReachTarget = target - myCount;
+            // balance on leases that still need processing; hard cap on counted leases
+            int myCount = leaseCounts.get(workerIdentifier) - myHeldNotCounted;
+            final int capRoom = Math.max(0, maxLeasesForWorker - myCountedLeases);
+            numLeasesToReachTarget = Math.min(target - myCount, capRoom);
+            leaseSpillover = Math.max(0, target - myCount - capRoom);
+            if (target - myCount > capRoom && capRoom == 0) {
+                log.warn(
+                        "Worker {} holds {} leases that count toward maxLeasesForWorker {} and will not take more."
+                                + " Some shards may not be processed until leases finish or workers are added.",
+                        workerIdentifier,
+                        myCountedLeases,
+                        maxLeasesForWorker);
+            }
 
-            int currentLeaseCount = leaseCounts.get(workerIdentifier);
+            int currentLeaseCount = myCountedLeases;
             // If there are leases that have been expired for an extended period of
             // time, take them with priority, disregarding the target (computed
             // later) but obeying the maximum limit per worker.
+            // With maxLeasesForWorker set, retake my own expired leases first (before the very-old path, which
+            // returns early); e.g. a lease dropped by a shutdown task. They are already in myCountedLeases, so
+            // retaking one does not use a new slot, but never retake more counted leases than maxLeasesForWorker.
+            if (isMaxLeasesForWorkerSet()) {
+                int ownCountedRoom = maxLeasesForWorker
+                        - (myCountedLeases
+                                - (int) availableLeases.stream()
+                                        .filter(lease -> workerIdentifier.equals(lease.leaseOwner()))
+                                        .filter(this::isCounted)
+                                        .count());
+                for (final Lease own : new ArrayList<>(availableLeases)) {
+                    if (!workerIdentifier.equals(own.leaseOwner())) {
+                        continue;
+                    }
+                    if (isCounted(own)) {
+                        if (ownCountedRoom <= 0) {
+                            continue;
+                        }
+                        ownCountedRoom--;
+                    }
+                    leasesToTake.add(own);
+                    availableLeases.remove(own);
+                }
+            }
+
             if (enablePriorityLeaseAssignment) {
                 long currentNanoTime;
                 try {
@@ -478,6 +587,8 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
                 final long nanoThreshold = currentNanoTime - (veryOldLeaseDurationNanosMultiplier * leaseDurationNanos);
                 final List<Lease> veryOldLeases = allLeases.values().stream()
                         .filter(lease -> nanoThreshold > lease.lastCounterIncrementNanos())
+                        .filter(lease -> !isBlocked(lease))
+                        .filter(lease -> !isMaxLeasesForWorkerSet() || !workerIdentifier.equals(lease.leaseOwner()))
                         .collect(Collectors.toList());
 
                 if (!veryOldLeases.isEmpty()) {
@@ -485,6 +596,7 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
                     veryOldLeaseCount =
                             Math.max(0, Math.min(maxLeasesForWorker - currentLeaseCount, veryOldLeases.size()));
                     HashSet<Lease> result = new HashSet<>(veryOldLeases.subList(0, veryOldLeaseCount));
+                    result.addAll(leasesToTake);
                     if (veryOldLeaseCount > 0) {
                         log.info("Taking leases that have been expired for a long time: {}", result);
                     }
@@ -493,18 +605,25 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
             }
 
             if (numLeasesToReachTarget <= 0) {
-                // If we don't need anything, return the empty set.
+                // No room for a lease that takes a slot; blocked leases may still be taken within the target.
+                takeBlockedLeases(blockedAvailable, target - myCount - leasesToTake.size(), leasesToTake);
                 return leasesToTake;
             }
 
-            // Shuffle availableLeases so workers don't all try to contend for the same leases.
+            // Shuffle availableLeases so workers don't all try to contend for the same leases, then take leases that
+            // are a parent of another lease first so a split/merge lineage always progresses.
             Collections.shuffle(availableLeases);
+            final Set<String> parents = parentLeaseKeys();
+            availableLeases.sort(Comparator.comparingInt(lease -> parents.contains(lease.leaseKey()) ? 0 : 1));
 
             if (availableLeases.size() > 0) {
                 // If we have available leases, get up to <needed> leases from availableLeases
                 for (; numLeasesToReachTarget > 0 && availableLeases.size() > 0; numLeasesToReachTarget--) {
                     leasesToTake.add(availableLeases.remove(0));
                 }
+                takeBlockedLeases(blockedAvailable, target - myCount - leasesToTake.size(), leasesToTake);
+            } else if (!blockedAvailable.isEmpty()) {
+                takeBlockedLeases(blockedAvailable, target - myCount - leasesToTake.size(), leasesToTake);
             } else {
                 // If there are no available leases and we need a lease, consider stealing.
                 List<Lease> leasesToSteal = chooseLeasesToSteal(leaseCounts, numLeasesToReachTarget, target);
@@ -534,6 +653,7 @@ public class DynamoDBLeaseTaker implements LeaseTaker {
         } finally {
             scope.addData("ExpiredLeases", numAvailableLeases, StandardUnit.COUNT, MetricsLevel.SUMMARY);
             scope.addData("LeaseSpillover", leaseSpillover, StandardUnit.COUNT, MetricsLevel.SUMMARY);
+            scope.addData("BlockedChildLeases", numBlockedAvailable, StandardUnit.COUNT, MetricsLevel.SUMMARY);
             scope.addData("LeasesToTake", leasesToTake.size(), StandardUnit.COUNT, MetricsLevel.DETAILED);
             scope.addData(
                     "NeededLeases", Math.max(numLeasesToReachTarget, 0), StandardUnit.COUNT, MetricsLevel.DETAILED);
