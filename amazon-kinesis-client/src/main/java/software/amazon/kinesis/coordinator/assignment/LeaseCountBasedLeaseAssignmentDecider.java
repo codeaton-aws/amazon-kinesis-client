@@ -15,6 +15,7 @@
 
 package software.amazon.kinesis.coordinator.assignment;
 
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -29,6 +30,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import software.amazon.kinesis.annotations.KinesisClientInternalApi;
 import software.amazon.kinesis.leases.Lease;
+import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 
 import static java.util.Objects.nonNull;
 
@@ -63,9 +65,12 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
             return;
         }
 
-        expiredOrUnAssignedLeases.sort(Comparator.comparingLong(Lease::lastCounterIncrementNanos));
+        // Leases that are a parent of another lease first (finishing them unblocks children), then oldest first.
+        expiredOrUnAssignedLeases.sort(
+                Comparator.comparingInt((Lease lease) -> inMemoryStorageView.isParentOfAnotherLease(lease) ? 0 : 1)
+                        .thenComparingLong(Lease::lastCounterIncrementNanos));
 
-        final Map<String, Integer> leaseCountPerActiveWorker = getActiveWorkerLeaseCounts();
+        final Map<String, Integer> countedPerActiveWorker = getActiveWorkerLeaseCounts();
         final int target = calculateTargetLeaseCount();
 
         log.info(
@@ -74,28 +79,37 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
                 inMemoryStorageView.getActiveWorkerIdSet().size(),
                 target);
 
-        final List<String> workerQueue = leaseCountPerActiveWorker.entrySet().stream()
-                .sorted(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
-
         final Set<Lease> assignedLeases = new HashSet<>();
-        int workerIndex = 0;
-
         for (final Lease lease : expiredOrUnAssignedLeases) {
-            if (workerIndex >= workerQueue.size()) {
-                break;
+            final boolean counted = isCounted(lease);
+            // An expired lease is still mapped to its current owner: do not count it there while choosing its owner.
+            final String currentOwner = lease.actualOwner();
+            final boolean heldByActive = counted
+                    && nonNull(currentOwner)
+                    && countedPerActiveWorker.containsKey(currentOwner)
+                    && inMemoryStorageView
+                            .getWorkerToLeasesMap()
+                            .getOrDefault(currentOwner, Collections.emptySet())
+                            .contains(lease);
+            if (heldByActive) {
+                countedPerActiveWorker.merge(currentOwner, -1, Integer::sum);
             }
-
-            final String workerToAssign = workerQueue.get(workerIndex);
+            // least-loaded worker below the balance target and below maxLeasesForWorker (counted leases)
+            final String workerToAssign = countedPerActiveWorker.entrySet().stream()
+                    .filter(e -> !counted || (e.getValue() < target && e.getValue() < maxLeasesForWorker))
+                    .min(Map.Entry.comparingByValue())
+                    .map(Map.Entry::getKey)
+                    .orElse(null);
+            if (workerToAssign == null) {
+                if (heldByActive) {
+                    countedPerActiveWorker.merge(currentOwner, 1, Integer::sum);
+                }
+                continue;
+            }
             assignLease(lease, workerToAssign);
             assignedLeases.add(lease);
-
-            final int newCount = leaseCountPerActiveWorker.get(workerToAssign) + 1;
-            leaseCountPerActiveWorker.put(workerToAssign, newCount);
-
-            if (newCount >= target) {
-                workerIndex++;
+            if (counted) {
+                countedPerActiveWorker.merge(workerToAssign, 1, Integer::sum);
             }
         }
 
@@ -141,13 +155,24 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
 
             // Find available lease from overloaded worker. These are leases not pending handoffs
             final List<Lease> availableLeases = availableLeasesByWorker.get(overloaded.getKey());
-            final Lease leaseToSteal =
-                    (availableLeases != null && !availableLeases.isEmpty()) ? availableLeases.remove(0) : null;
+            // never move a counted lease to a worker that is already at maxLeasesForWorker
+            final boolean underloadedAtMax = underloaded.getValue() >= maxLeasesForWorker;
+            Lease leaseToSteal = null;
+            if (availableLeases != null) {
+                for (int i = 0; i < availableLeases.size(); i++) {
+                    if (!underloadedAtMax || !isCounted(availableLeases.get(i))) {
+                        leaseToSteal = availableLeases.remove(i);
+                        break;
+                    }
+                }
+            }
 
             if (leaseToSteal != null) {
                 assignLease(leaseToSteal, underloaded.getKey());
-                underloaded.setValue(underloaded.getValue() + 1);
-                overloaded.setValue(overloaded.getValue() - 1);
+                if (isCounted(leaseToSteal)) {
+                    underloaded.setValue(underloaded.getValue() + 1);
+                    overloaded.setValue(overloaded.getValue() - 1);
+                }
             } else {
                 right--;
             }
@@ -160,32 +185,23 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
      * @return target lease count per worker, capped by maxLeasesForWorker
      */
     private int calculateTargetLeaseCount() {
-        final int totalLeases = inMemoryStorageView.getLeaseList().size();
+        // Balance on leases that need a slot: not SHARD_END, and not a child that is still blocked on a parent
+        // (blocked children are deferred until their parents end). maxLeasesForWorker is not applied to the target;
+        // it is a hard cap on counted leases enforced per assignment.
+        final long needSlot = inMemoryStorageView.getLeaseList().stream()
+                .filter(this::isCounted)
+                .filter(lease -> !inMemoryStorageView.isLeaseBlocked(lease) || nonNull(lease.actualOwner()))
+                .count();
         final int totalWorkers = inMemoryStorageView.getActiveWorkerIdSet().size();
-        int target;
-        int leaseSpillover = 0;
-        if (totalWorkers >= totalLeases) {
-            // If we have n leases and n or more workers, each worker can have up to 1 lease
-            target = 1;
-        } else {
-            // More leases than workers: target = ceil(totalLeases / totalWorkers)
-            // This ensures even distribution with remainder leases going to some workers
-            target = totalLeases / totalWorkers + (totalLeases % totalWorkers == 0 ? 0 : 1);
-
-            // Spill over is the number of leases this worker should have claimed, but did not because it would
-            // exceed the max allowed for this worker.
-            leaseSpillover = Math.max(0, target - maxLeasesForWorker);
-            if (target > maxLeasesForWorker) {
-                log.warn(
-                        "Target is {} leases and maxLeasesForWorker is {}. Resetting target to {},"
-                                + " lease spillover is {}. Note that some shards may not be processed if no other "
-                                + "workers are able to pick them up.",
-                        target,
-                        maxLeasesForWorker,
-                        maxLeasesForWorker,
-                        leaseSpillover);
-                target = maxLeasesForWorker;
-            }
+        final int target = (int) Math.max(1, (needSlot + totalWorkers - 1) / Math.max(1, totalWorkers));
+        if (needSlot > (long) maxLeasesForWorker * totalWorkers) {
+            log.warn(
+                    "{} leases need a slot but fleet capacity is {} ({} workers x maxLeasesForWorker {})."
+                            + " Some shards may not be processed until leases finish or workers are added.",
+                    needSlot,
+                    (long) maxLeasesForWorker * totalWorkers,
+                    totalWorkers,
+                    maxLeasesForWorker);
         }
         return target;
     }
@@ -200,18 +216,20 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
         final Map<String, Integer> estimatedCounts = new HashMap<>();
         final Set<String> activeWorkers = inMemoryStorageView.getActiveWorkerIdSet();
 
-        // Count leases by actual owner, only for active workers
+        // Count counted (non-SHARD_END) leases by actual owner, only for active workers, plus leases being handed
+        // off to the worker.
         for (final Map.Entry<String, Set<Lease>> entry :
                 inMemoryStorageView.getWorkerToLeasesMap().entrySet()) {
             final String workerId = entry.getKey();
             if (nonNull(workerId) && activeWorkers.contains(workerId)) {
-                estimatedCounts.put(workerId, entry.getValue().size());
+                estimatedCounts.put(workerId, (int)
+                        entry.getValue().stream().filter(this::isCounted).count());
             }
         }
 
         // Ensure all active workers are represented
         for (final String workerId : activeWorkers) {
-            estimatedCounts.putIfAbsent(workerId, 0);
+            estimatedCounts.merge(workerId, inMemoryStorageView.getPendingHandoffInCount(workerId), Integer::sum);
         }
 
         return estimatedCounts;
@@ -232,6 +250,7 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
             final String workerId = entry.getKey();
             final List<Lease> workerAvailableLeases = entry.getValue().stream()
                     .filter(lease -> !lease.blockedOnPendingCheckpoint(currentTimeMillis))
+                    .filter(lease -> !inMemoryStorageView.isLeaseBlocked(lease))
                     .collect(Collectors.toList());
 
             if (!workerAvailableLeases.isEmpty()) {
@@ -240,6 +259,14 @@ public final class LeaseCountBasedLeaseAssignmentDecider implements LeaseAssignm
         }
 
         return availableLeases;
+    }
+
+    /**
+     * A lease takes a maxLeasesForWorker slot unless it is at SHARD_END. Without a maxLeasesForWorker limit every lease
+     * is counted, so balancing is unchanged.
+     */
+    private boolean isCounted(final Lease lease) {
+        return maxLeasesForWorker == Integer.MAX_VALUE || !ExtendedSequenceNumber.SHARD_END.equals(lease.checkpoint());
     }
 
     private void assignLease(final Lease lease, final String workerId) {
