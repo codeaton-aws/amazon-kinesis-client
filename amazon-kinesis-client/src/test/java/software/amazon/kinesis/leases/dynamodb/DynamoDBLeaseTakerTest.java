@@ -15,6 +15,7 @@
 package software.amazon.kinesis.leases.dynamodb;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -172,6 +173,141 @@ public class DynamoDBLeaseTakerTest {
         expectedOutput.add(createLease("baz", "6", veryOldThreshold + 1));
         expectedOutput.add(createLease(null, "7"));
         assertEquals(expectedOutput, output);
+    }
+
+    @Test
+    public void test_shardEndLeasesDoNotCountTowardMaxLeases() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(2);
+        Lease ended = rootLease("foo", "a");
+        ended.checkpoint(ExtendedSequenceNumber.SHARD_END);
+        final List<Lease> all = Arrays.asList(
+                ended, rootLease("foo", "b"), rootLease("baz", "c"), rootLease("baz", "d"), rootLease("baz", "e"));
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output = taker.computeLeasesToTake(new ArrayList<>(all.subList(2, 5)), timeProvider);
+
+        // 1 active + 1 SHARD_END held, cap 2: exactly one more slot
+        assertEquals(1, output.size());
+    }
+
+    @Test
+    public void test_neverExceedsMaxLeasesForWorker() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(2);
+        final List<Lease> all = Arrays.asList(rootLease("foo", "a"), rootLease("foo", "b"), rootLease("baz", "c"));
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output = taker.computeLeasesToTake(new ArrayList<>(all.subList(2, 3)), timeProvider);
+
+        assertEquals(0, output.size());
+    }
+
+    @Test
+    public void test_blockedChildLeasesAreNotTaken() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(10);
+        Lease parent = rootLease("bar", "parent");
+        Lease child = rootLease("baz", "child");
+        child.parentShardIds(Collections.singleton("parent"));
+        Lease other = rootLease("baz", "other");
+        final List<Lease> all = Arrays.asList(parent, child, other);
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output = taker.computeLeasesToTake(new ArrayList<>(Arrays.asList(child, other)), timeProvider);
+
+        assertEquals(Collections.singleton(other), output);
+    }
+
+    @Test
+    public void test_ownExpiredLeaseIsRetakenWithoutUsingASlot() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(2);
+        Lease held = rootLease("foo", "a");
+        Lease ownExpired = rootLease("foo", "b");
+        Lease otherExpired = rootLease("baz", "c");
+        final List<Lease> all = Arrays.asList(held, ownExpired, otherExpired);
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output =
+                taker.computeLeasesToTake(new ArrayList<>(Arrays.asList(ownExpired, otherExpired)), timeProvider);
+
+        // the table already shows 2 leases owned by foo (= max): retake its own lease, take nothing new
+        assertEquals(Collections.singleton(ownExpired), output);
+    }
+
+    @Test
+    public void test_ownVeryOldExpiredLeaseIsRetakenWithoutUsingASlot() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(2);
+        Lease held = rootLease("foo", "a");
+        Lease ownExpired = rootLease("foo", "b");
+        ownExpired.lastCounterIncrementNanos(0L); // expired for a long time: the very-old priority path applies
+        Lease otherVeryOld = rootLease("baz", "c");
+        otherVeryOld.lastCounterIncrementNanos(0L);
+        final List<Lease> all = Arrays.asList(held, ownExpired, otherVeryOld);
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output =
+                taker.computeLeasesToTake(new ArrayList<>(Arrays.asList(ownExpired, otherVeryOld)), timeProvider);
+
+        assertEquals(Collections.singleton(ownExpired), output);
+    }
+
+    @Test
+    public void test_ownExpiredLeasesAreNotRetakenAboveMaxLeases() throws Exception {
+        DynamoDBLeaseTaker taker = new DynamoDBLeaseTaker(
+                        leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory)
+                .withMaxLeasesForWorker(1);
+        Lease held = rootLease("foo", "a");
+        Lease ownExpired = rootLease("foo", "b");
+        final List<Lease> all = Arrays.asList(held, ownExpired, rootLease("baz", "c"));
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output = taker.computeLeasesToTake(new ArrayList<>(Arrays.asList(ownExpired)), timeProvider);
+
+        // foo already processes 1 lease (= max, e.g. after max was lowered): its own expired lease is left available
+        assertEquals(0, output.size());
+    }
+
+    @Test
+    public void test_maxLeasesNotSet_blockedChildLeaseIsTakenAsBefore() throws Exception {
+        DynamoDBLeaseTaker taker =
+                new DynamoDBLeaseTaker(leaseRefresher, WORKER_IDENTIFIER, LEASE_DURATION_MILLIS, metricsFactory);
+        Lease parent = rootLease("bar", "parent");
+        Lease child = rootLease("baz", "child");
+        child.parentShardIds(Collections.singleton("parent"));
+        final List<Lease> all = Arrays.asList(parent, child);
+        taker.allLeases.putAll(all.stream().collect(Collectors.toMap(Lease::leaseKey, Function.identity())));
+        when(metricsFactory.createMetrics()).thenReturn(new NullMetricsScope());
+        when(timeProvider.call()).thenReturn(MOCK_CURRENT_TIME);
+
+        Set<Lease> output = taker.computeLeasesToTake(new ArrayList<>(Arrays.asList(child)), timeProvider);
+
+        assertEquals(Collections.singleton(child), output);
+    }
+
+    private Lease rootLease(String leaseOwner, String leaseKey) {
+        Lease lease = createLease(leaseOwner, leaseKey, MOCK_CURRENT_TIME);
+        lease.parentShardIds(new HashSet<>());
+        return lease;
     }
 
     private Lease createLease(String leaseOwner, String leaseKey) {

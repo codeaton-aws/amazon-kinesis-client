@@ -59,6 +59,7 @@ import software.amazon.kinesis.metrics.MetricsLevel;
 import software.amazon.kinesis.metrics.MetricsScope;
 import software.amazon.kinesis.metrics.MetricsUtil;
 import software.amazon.kinesis.metrics.NullMetricsScope;
+import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 import software.amazon.kinesis.worker.metricstats.WorkerMetricStats;
 
 import static java.util.Objects.isNull;
@@ -217,6 +218,18 @@ public final class LeaseAssignmentManager {
                     .map(l -> l.isExpiredOrUnassigned(true))
                     .collect(Collectors.toList());
 
+            // Defer child leases that are blocked on a parent: they cannot be processed yet, so assigning them
+            // would only take a slot that the parent needs. They are assigned in the first run after their parents
+            // reach SHARD_END.
+            final int deferredBlockedLeases = (int) expiredOrUnAssignedLeases.stream()
+                    .filter(inMemoryStorageView::isLeaseBlocked)
+                    .count();
+            if (deferredBlockedLeases > 0) {
+                expiredOrUnAssignedLeases.removeIf(inMemoryStorageView::isLeaseBlocked);
+                log.info("Deferred {} child leases that are blocked on a parent shard", deferredBlockedLeases);
+            }
+            metricsScope.addData(
+                    "DeferredBlockedLeases", deferredBlockedLeases, StandardUnit.COUNT, MetricsLevel.SUMMARY);
             log.info("Total expiredOrUnassignedLeases count : {}", expiredOrUnAssignedLeases.size());
             metricsScope.addData(
                     "ExpiredLeases", expiredOrUnAssignedLeases.size(), StandardUnit.COUNT, MetricsLevel.SUMMARY);
@@ -489,6 +502,20 @@ public final class LeaseAssignmentManager {
          * Captures the new assignment done during the lifecycle of single run.
          */
         private final Map<Lease, String> leaseToNewAssignedWorkerMap = new HashMap<>();
+        /**
+         * Lease lookup by lease key and the set of lease keys that are a parent of another lease, both from the
+         * lease table scan; used to find child leases that are blocked on a parent.
+         */
+        private final Map<String, Lease> leaseByKey = new HashMap<>();
+
+        private final Set<String> parentLeaseKeys = new HashSet<>();
+
+        /**
+         * Leases in a graceful handoff (checkpointOwner set) are mapped to their current owner (actualOwner) but are
+         * about to be processed by the incoming owner (leaseOwner): count them for the incoming owner as well so the
+         * incoming owner never goes over maxLeasesForWorker when the handoff completes.
+         */
+        private final Map<String, Integer> pendingHandoffInCount = new HashMap<>();
 
         /**
          * List of all leases in the application.
@@ -542,6 +569,15 @@ public final class LeaseAssignmentManager {
             final LAMDataSnapshot snapshot = lamDataManager.loadData(metricsScope);
 
             this.leaseList = snapshot.getLeases();
+            this.leaseList.forEach(lease -> {
+                leaseByKey.put(lease.leaseKey(), lease);
+                if (lease.parentShardIds() != null) {
+                    lease.parentShardIds().forEach(parent -> parentLeaseKeys.add(parentLeaseKey(lease, parent)));
+                }
+                if (maxLeasesForWorker != Integer.MAX_VALUE && isPendingHandoffIn(lease)) {
+                    pendingHandoffInCount.merge(lease.leaseOwner(), 1, Integer::sum);
+                }
+            });
             this.leaseTableScanTime = nanoTimeProvider.get();
             log.info("Total Leases available : {}", leaseList.size());
 
@@ -633,13 +669,73 @@ public final class LeaseAssignmentManager {
          * no leases assigned or less than maxNumberOfLeasesPerHost else false.
          */
         public boolean isWorkerAssignedLeasesLessThanMaxLeases(final String workerId) {
+            return getCountedLeaseCount(workerId) < maxLeasesForWorker;
+        }
+
+        /**
+         * Leases of the worker that count toward maxLeasesForWorker: every assigned lease that is not at SHARD_END,
+         * plus leases being handed off to the worker (see {@link #getPendingHandoffInCount(String)}).
+         * A SHARD_END lease does no processing and only waits for LeaseCleanupManager, so it does not take a slot.
+         * Child leases are not assigned while they are blocked (see {@link #isLeaseBlocked(Lease)}), so a counted lease
+         * is normally being processed or will be processed in the slot it already holds once its parent ends.
+         */
+        public int getCountedLeaseCount(final String workerId) {
             final Set<Lease> assignedLeases = workerToLeasesMap.get(workerId);
             if (CollectionUtils.isEmpty(assignedLeases)) {
-                // There are no leases assigned to the worker, that means its less than maxNumberOfLeasesPerHost.
-                return true;
-            } else {
-                return assignedLeases.size() < maxLeasesForWorker;
+                return pendingHandoffInCount.getOrDefault(workerId, 0);
             }
+            return (int) assignedLeases.stream()
+                            .filter(lease -> !ExtendedSequenceNumber.SHARD_END.equals(lease.checkpoint()))
+                            .count()
+                    + pendingHandoffInCount.getOrDefault(workerId, 0);
+        }
+
+        /** Number of non-SHARD_END leases being handed off TO the worker (counted for it in addition). */
+        public int getPendingHandoffInCount(final String workerId) {
+            return pendingHandoffInCount.getOrDefault(workerId, 0);
+        }
+
+        private boolean isPendingHandoffIn(final Lease lease) {
+            return lease.shutdownRequested()
+                    && lease.leaseOwner() != null
+                    && !lease.leaseOwner().equals(lease.checkpointOwner())
+                    && !ExtendedSequenceNumber.SHARD_END.equals(lease.checkpoint());
+        }
+
+        /**
+         * A child lease is blocked while any of its immediate parent leases is still in the lease table and not at
+         * SHARD_END (a child cannot be processed before all immediate parents are at SHARD_END). A parent lease that
+         * was already cleaned up counts as ended. Only used when maxLeasesForWorker is set: without a limit no lease
+         * is treated as blocked and assignment is unchanged.
+         */
+        public boolean isLeaseBlocked(final Lease lease) {
+            if (maxLeasesForWorker == Integer.MAX_VALUE) {
+                return false;
+            }
+            if (ExtendedSequenceNumber.SHARD_END.equals(lease.checkpoint()) || lease.parentShardIds() == null) {
+                return false;
+            }
+            for (final String parentShardId : lease.parentShardIds()) {
+                final Lease parent = leaseByKey.get(parentLeaseKey(lease, parentShardId));
+                if (parent != null && !ExtendedSequenceNumber.SHARD_END.equals(parent.checkpoint())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * True when another lease in the table names this lease as a parent: finishing it unblocks a child, so it is
+         * assigned before leaf leases.
+         */
+        public boolean isParentOfAnotherLease(final Lease lease) {
+            return parentLeaseKeys.contains(lease.leaseKey());
+        }
+
+        private String parentLeaseKey(final Lease lease, final String parentShardId) {
+            return lease instanceof MultiStreamLease
+                    ? MultiStreamLease.getLeaseKey(((MultiStreamLease) lease).streamIdentifier(), parentShardId)
+                    : parentShardId;
         }
 
         public Double getTotalAssignedThroughput(final String workerId) {
